@@ -2,10 +2,8 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Diagnostics.Tracing.Parsers;
-using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
 using Microsoft.Diagnostics.Tracing.Session;
 using Newtonsoft.Json;
 
@@ -49,6 +47,12 @@ namespace BuildTracer
         }
     }
 
+    public enum CreateFileType
+    {
+        Read,
+        Write
+    }
+
     class Program
     {
         private static Result TraceChildren(int rootPid)
@@ -61,7 +65,8 @@ namespace BuildTracer
             fileWrites.Add(rootPid, (new HashSet<string>(), new List<string>()));
             fileReads.Add(rootPid, (new HashSet<string>(), new List<string>()));
 
-            var openedFiles = new Dictionary<string, FileStream>();
+            var argsFiles = new Dictionary<string, FileStream>();
+            var lastCreateFileType = new Dictionary<string, CreateFileType>();
 
             using var session = new TraceEventSession("BuildTracer");
             Console.CancelKeyPress += (sender, eventArgs) => session.Stop();
@@ -72,7 +77,7 @@ namespace BuildTracer
                 session.Stop();
             });
 
-            session.EnableKernelProvider(KernelTraceEventParser.Keywords.Process | KernelTraceEventParser.Keywords.FileIOInit | KernelTraceEventParser.Keywords.FileIO | KernelTraceEventParser.Keywords.DiskFileIO);
+            session.EnableKernelProvider(KernelTraceEventParser.Keywords.Process | KernelTraceEventParser.Keywords.FileIOInit | KernelTraceEventParser.Keywords.FileIO | KernelTraceEventParser.Keywords.DiskFileIO | KernelTraceEventParser.Keywords.VAMap);
 
             session.Source.Kernel.ProcessStart += processData =>
             {
@@ -109,9 +114,9 @@ namespace BuildTracer
 
             session.Source.Kernel.FileIOCreate += createFile =>
             {
-                if (subprocessCommandLines.ContainsKey(createFile.ProcessID) && IsArgsFile(createFile.FileName))
+                if (subprocessCommandLines.ContainsKey(createFile.ProcessID))
                 {
-                    if (!openedFiles.ContainsKey(createFile.FileName))
+                    if (IsArgsFile(createFile.FileName) && !argsFiles.ContainsKey(createFile.FileName))
                     {
                         try
                         {
@@ -119,13 +124,46 @@ namespace BuildTracer
                                 createFile.FileName, FileMode.Open, FileAccess.Read,
                                 FileShare.ReadWrite | FileShare.Delete);
 
-                            openedFiles.Add(createFile.FileName, fileHandle);
+                            argsFiles.Add(createFile.FileName, fileHandle);
                             
                             Console.WriteLine($"Create {createFile.FileName}, Share {createFile.ShareAccess}, Disposition: {createFile.CreateDispostion}, Options: {createFile.CreateOptions}");
                         }
                         catch (Exception e)
                         {
                         }
+                    }
+
+                    if (createFile.FileName.EndsWith("obj"))
+                    {
+                        Console.WriteLine($"Create: {createFile}");
+                    }
+
+                    lastCreateFileType[createFile.FileName] =
+                        (int) createFile.CreateDispostion == 1 /* CreateDisposition.OPEN_EXISING */ // Bug in TraceEvent - Open is 1.
+                            ? CreateFileType.Read
+                            : CreateFileType.Write;
+                }
+            };
+
+            session.Source.Kernel.FileIOMapFile += fileMap =>
+            {
+                var fileName = fileMap.FileName;
+                if (subprocessCommandLines.ContainsKey(fileMap.ProcessID) && fileName.Length > 0)
+                {
+                    Console.WriteLine($"Mapping {fileName}");
+
+                    if (fileName.EndsWith("obj"))
+                    {
+                        Console.WriteLine(fileMap);
+                    }
+
+                    var dict = lastCreateFileType[fileName] == CreateFileType.Read ? fileReads : fileWrites;
+
+                    var (set, list) = dict[fileMap.ProcessID];
+                    if (!set.Contains(fileName))
+                    {
+                        set.Add(fileName);
+                        list.Add(fileName);
                     }
                 }
             };
@@ -160,7 +198,7 @@ namespace BuildTracer
 
             var rspFiles = new List<RspFile>();
 
-            foreach (var (path, stream) in openedFiles)
+            foreach (var (path, stream) in argsFiles)
             {
                 // This detects BOM/UTF8/UTF16
                 var contents = new StreamReader(stream).ReadToEnd();
@@ -177,10 +215,39 @@ namespace BuildTracer
                 rspFiles);
         }
 
+        public static Result PostProcess(Result result)
+        {
+            // Empty outputs -> Remove
+            // Empty path -> remove
+            // Temp path -> Remove
+            // .tlog path -> Remove
+            // Both read & write -> Remove read.
+            var newProcesses = result.InvokedProcesses
+                .Select(PostProcessPaths)
+                .Where(p => p.FileWrites.Count > 0)
+                .ToList();
+
+            return new Result(newProcesses, result.RspFiles);
+        }
+
+        public static bool FilterPath(String path)
+        {
+            return path.Length > 0 && !path.Contains(@"\Temp\") && !path.Contains(".tlog");
+        }
+
+        public static ProcessInfo PostProcessPaths(ProcessInfo info)
+        {
+            var writesSet = info.FileWrites.ToHashSet();
+            var reads = info.FileReads.Where(input => !writesSet.Contains(input));
+            return new ProcessInfo(info.CommandLine, reads.Where(FilterPath).ToList(), info.FileWrites.Where(FilterPath).ToList());
+        }
+
         static void Main(string[] args)
         {
+            Console.WriteLine($"Tracing PID {args[0]}");
             var result = TraceChildren(int.Parse(args[0]));
-            var json = JsonConvert.SerializeObject(result, Formatting.Indented);
+            var postProcessedResult = PostProcess(result);
+            var json = JsonConvert.SerializeObject(postProcessedResult, Formatting.Indented);
             File.WriteAllText("build_trace.json", json);
         }
     }
