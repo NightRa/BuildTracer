@@ -4,6 +4,7 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>netcoreapp3.1</TargetFramework>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Nullable>enable</Nullable>
 
     <!-- <UseHostCompilerIfAvailable>false</UseHostCompilerIfAvailable> -->
     <!-- <UseSharedCompilation>false</UseSharedCompilation> -->

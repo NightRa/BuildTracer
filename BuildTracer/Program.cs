@@ -9,7 +9,7 @@ using Newtonsoft.Json;
 
 namespace BuildTracer
 {
-    public class ProcessInfo
+    public sealed class ProcessInfo
     {
         public string CommandLine { get; }
         public List<string> FileReads { get; }
@@ -23,7 +23,7 @@ namespace BuildTracer
         }
     }
 
-    public class RspFile
+    public sealed class RspFile
     {
         public String FileName { get; }
         public String Contents { get; }
@@ -35,17 +35,44 @@ namespace BuildTracer
         }
     }
 
-    public class Result
+    public class BuildTrace
     {
         public List<ProcessInfo> InvokedProcesses { get; }
         public List<RspFile> RspFiles { get; }
 
-        public Result(List<ProcessInfo> invokedProcesses, List<RspFile> rspFiles)
+        public BuildTrace(List<ProcessInfo> invokedProcesses, List<RspFile> rspFiles)
         {
             InvokedProcesses = invokedProcesses;
             RspFiles = rspFiles;
         }
     }
+
+    public class BuildCommands
+    {
+        public List<Command> Commands { get; }
+
+        public BuildCommands(List<Command> commands)
+        {
+            Commands = commands;
+        }
+    }
+
+    public sealed class Command
+    {
+        public String CommandLine { get; }
+        public List<String> FileReads { get; }
+        public List<String> FileWrites { get; }
+        public RspFile? RspFile { get; }
+
+        public Command(string commandLine, List<string> fileReads, List<string> fileWrites, RspFile? rspFile)
+        {
+            CommandLine = commandLine;
+            FileReads = fileReads;
+            FileWrites = fileWrites;
+            RspFile = rspFile;
+        }
+    }
+
 
     public enum CreateFileType
     {
@@ -55,7 +82,7 @@ namespace BuildTracer
 
     class Program
     {
-        private static Result TraceChildren(int rootPid)
+        private static BuildTrace TraceChildren(int rootPid)
         {
             Dictionary<int, string> subprocessCommandLines = new Dictionary<int, string>();
             subprocessCommandLines.Add(rootPid, "root");
@@ -66,7 +93,7 @@ namespace BuildTracer
             fileReads.Add(rootPid, (new HashSet<string>(), new List<string>()));
 
             var argsFiles = new Dictionary<string, FileStream>();
-            var lastCreateFileType = new Dictionary<string, CreateFileType>();
+            var lastCreateFileType = new Dictionary<(int pid, string path), CreateFileType>();
 
             using var session = new TraceEventSession("BuildTracer");
             Console.CancelKeyPress += (sender, eventArgs) => session.Stop();
@@ -138,7 +165,7 @@ namespace BuildTracer
                         Console.WriteLine($"Create: {createFile}");
                     }
 
-                    lastCreateFileType[createFile.FileName] =
+                    lastCreateFileType[(createFile.ProcessID, createFile.FileName)] =
                         (int) createFile.CreateDispostion == 1 /* CreateDisposition.OPEN_EXISING */ // Bug in TraceEvent - Open is 1.
                             ? CreateFileType.Read
                             : CreateFileType.Write;
@@ -157,7 +184,7 @@ namespace BuildTracer
                         Console.WriteLine(fileMap);
                     }
 
-                    var dict = lastCreateFileType[fileName] == CreateFileType.Read ? fileReads : fileWrites;
+                    var dict = lastCreateFileType[(fileMap.ProcessID, fileName)] == CreateFileType.Read ? fileReads : fileWrites;
 
                     var (set, list) = dict[fileMap.ProcessID];
                     if (!set.Contains(fileName))
@@ -202,11 +229,11 @@ namespace BuildTracer
             {
                 // This detects BOM/UTF8/UTF16
                 var contents = new StreamReader(stream).ReadToEnd();
-                rspFiles.Add(new RspFile(Path.GetFileName(path), contents));
+                rspFiles.Add(new RspFile(path, contents));
                 stream.Dispose();
             }
 
-            return new Result(subprocessCommandLines.Select(kv =>
+            return new BuildTrace(subprocessCommandLines.Select(kv =>
             {
                 var pid = kv.Key;
                 var cmdLine = kv.Value;
@@ -215,31 +242,37 @@ namespace BuildTracer
                 rspFiles);
         }
 
-        public static Result PostProcess(Result result)
+        public static BuildCommands PostProcess(BuildTrace buildTrace)
         {
-            // Empty outputs -> Remove
-            // Empty path -> remove
-            // Temp path -> Remove
-            // .tlog path -> Remove
-            // Both read & write -> Remove read.
-            var newProcesses = result.InvokedProcesses
-                .Select(PostProcessPaths)
+            var rspFiles =
+                buildTrace.RspFiles.ToDictionary(r => r.FileName, r => r);
+
+            var commands = buildTrace.InvokedProcesses
+                .Select(p => PostProcessPaths(p, rspFiles))
                 .Where(p => p.FileWrites.Count > 0)
                 .ToList();
 
-            return new Result(newProcesses, result.RspFiles);
+            return new BuildCommands(commands);
         }
 
         public static bool FilterPath(String path)
         {
-            return path.Length > 0 && !path.Contains(@"\Temp\") && !path.Contains(".tlog");
+            return path.Length > 0 && !path.Contains(@"\Temp\") && !path.Contains(".tlog") && !path.EndsWith(".pf");
         }
 
-        public static ProcessInfo PostProcessPaths(ProcessInfo info)
+        public static Command PostProcessPaths(ProcessInfo info, Dictionary<String, RspFile> rspFiles)
         {
             var writesSet = info.FileWrites.ToHashSet();
             var reads = info.FileReads.Where(input => !writesSet.Contains(input));
-            return new ProcessInfo(info.CommandLine, reads.Where(FilterPath).ToList(), info.FileWrites.Where(FilterPath).ToList());
+            var rspPath = info.FileReads.Find(path => path.EndsWith(".rsp"));
+
+            RspFile? rspFile = null;
+            if (rspPath != null)
+            {
+                rspFiles.TryGetValue(rspPath, out rspFile);
+            }
+
+            return new Command(info.CommandLine, reads.Where(FilterPath).ToList(), info.FileWrites.Where(FilterPath).ToList(), rspFile);
         }
 
         static void Main(string[] args)
@@ -249,6 +282,9 @@ namespace BuildTracer
             var postProcessedResult = PostProcess(result);
             var json = JsonConvert.SerializeObject(postProcessedResult, Formatting.Indented);
             File.WriteAllText("build_trace.json", json);
+
+            var ninja = NinjaTrace.CommandsToNinja(postProcessedResult.Commands);
+            File.WriteAllText("build.ninja", ninja);
         }
     }
 }
